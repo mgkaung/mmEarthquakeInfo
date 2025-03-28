@@ -1,0 +1,5 @@
+aiohttp==3.8.1
+feedparser==6.0.10
+reverse_geocoder==1.6.1
+python-telegram-bot==13.15
+googletrans==4.0.0-rc1
