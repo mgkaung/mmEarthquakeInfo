@@ -1,0 +1,1 @@
+worker: python quake.py
