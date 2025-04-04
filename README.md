@@ -32,7 +32,7 @@ Real-time earthquake monitoring system that sends alerts to Telegram for seismic
    pip install -r requirements.txt
 3. **Configure**
    ```bash
-   Insert your bot token   
+   Insert your bot token and channel in the config.py  
 4. **Run script**
    ```bash
    python quake.py  
