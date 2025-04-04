@@ -3,7 +3,7 @@ import asyncio
 import feedparser
 import reverse_geocoder as rg
 from telegram import Bot
-from telegram.utils.helpers import escape_markdown
+from telegram.utils.helpers import escape_markdown  # New (v20.0+)
 from telegram.error import TelegramError
 from googletrans import Translator
 from pathlib import Path
@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 import logging
 
 # Configuration
-BOT_TOKEN = 'Your_Telegram_Bot_Token'
-CHANNEL_ID = 'Your_Telegram_channel'
+from config import BOT_TOKEN, CHANNEL_ID  # Securely stored in separate file
+
 FEED_URL = 'https://earthquake.tmd.go.th/feed/rss_tmd.xml'
 STORAGE_PATH = Path('processed_ids.txt')
 RATE_LIMIT_DELAY = 2  # seconds between messages
@@ -26,61 +26,82 @@ logging.basicConfig(
 )
 
 async def get_rss_feed():
-    """Fetch RSS feed asynchronously [[1]]."""
+    """Fetch RSS feed with retry and SSL bypass"""
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(FEED_URL) as response:
-                return feedparser.parse(await response.text())
-        except Exception as e:
-            logging.error(f"RSS fetch failed: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                async with session.get(
+                    FEED_URL,
+                    ssl=False,  # Temporary SSL bypass
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    return feedparser.parse(await response.text())
+            except Exception as e:
+                logging.error(f"RSS fetch attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(2 ** attempt)
+        return None
 
 async def async_translate(text, dest='en'):
-    """Handle translation with input sanitization [[2]][[6]]."""
-    text = str(text) if text else ""
+    """Handle translation with input sanitization and run in a separate thread"""
+    text = str(text).strip() if text else ""
+    if not text:
+        return type('Dummy', (), {'text': text})()
     try:
-        return await asyncio.to_thread(translator.translate, text, dest=dest)
+        # Run the blocking translate function in a separate thread
+        translation = await asyncio.to_thread(translator.translate, text, dest=dest)
+        return type('Dummy', (), {'text': translation.text})()
     except Exception as e:
         logging.warning(f"Translation failed: {e}")
-        return type('Dummy', (), {'text': text})
+        return type('Dummy', (), {'text': text})()
 
 async def parse_entry(entry):
-    """Process earthquake data with timezone conversion [[3]][[7]]."""
-    # Time conversion UTC -> MMT (UTC+6:30)
-    utc_time_str = entry.get('tmd_time', 'N/A')
-    mmt_time = 'N/A'
-    
-    if utc_time_str != 'N/A':
-        try:
-            utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S UTC")
-            mmt_time = utc_time + timedelta(hours=6, minutes=30)
-            mmt_time = mmt_time.strftime("%Y-%m-%d %H:%M:%S MMT")
-        except ValueError:
-            mmt_time = 'N/A'
+    """Process earthquake data with improved error handling"""
+    try:
+        # Time conversion UTC -> MMT (UTC+6:30)
+        utc_time_str = entry.get('tmd_time', 'N/A')
+        mmt_time = 'N/A'
+        
+        if utc_time_str != 'N/A':
+            try:
+                utc_time = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S UTC")
+                mmt_time = utc_time + timedelta(hours=6, minutes=30)
+                mmt_time = mmt_time.strftime("%Y-%m-%d %H:%M:%S MMT")
+            except ValueError:
+                pass
 
-    # Geolocation processing
-    coordinates = (float(entry.get('geo_lat', 0)), 
-                   float(entry.get('geo_long', 0)))
-    
-    geo_data = rg.search(coordinates)[0] if coordinates != (0,0) else {}
-    
-    return {
-        'id': entry.get('id', entry.link),
-        'magnitude': entry.get('tmd_magnitude', 'N/A'),
-        'time_utc': utc_time_str,
-        'time_mmt': mmt_time,
-        'latitude': entry.get('geo_lat', 'N/A'),
-        'longitude': entry.get('geo_long', 'N/A'),
-        'depth_km': entry.get('tmd_depth', 'N/A'),
-        'location': (await async_translate(entry.get('title', 'Unknown'))).text,
-        'details': (await async_translate(entry.get('comments', ''))).text,
-        'nearest_city': geo_data.get('name', 'N/A'),
-        'country_code': geo_data.get('cc', 'N/A'),
-        'link': entry.get('link', '')
-    }
+        # Geolocation processing
+        coordinates = (float(entry.get('geo_lat', 0)), 
+                     float(entry.get('geo_long', 0)))
+        
+        if coordinates == (0.0, 0.0):
+            geo_data = {}
+        else:
+            try:
+                geo_data = rg.search(coordinates)[0]
+            except Exception as e:
+                logging.warning(f"Geocoding failed: {e}")
+                geo_data = {}
+
+        return {
+            'id': entry.get('id', entry.link),
+            'magnitude': entry.get('tmd_magnitude', 'N/A'),
+            'time_utc': utc_time_str,
+            'time_mmt': mmt_time,
+            'latitude': entry.get('geo_lat', 'N/A'),
+            'longitude': entry.get('geo_long', 'N/A'),
+            'depth_km': entry.get('tmd_depth', 'N/A'),
+            'location': (await async_translate(entry.get('title', 'Unknown'))).text,
+            'details': (await async_translate(entry.get('comments', ''))).text,
+            'nearest_city': geo_data.get('name', 'N/A'),
+            'country_code': geo_data.get('cc', 'N/A'),
+            'link': entry.get('link', '')
+        }
+    except Exception as e:
+        logging.error(f"Entry parsing failed: {e}")
+        return None
 
 async def send_telegram_message(bot, message):
-    """Send message with retry logic [[8]][[10]]."""
+    """Send message with retry logic"""
     for attempt in range(3):
         try:
             await asyncio.to_thread(
@@ -99,23 +120,23 @@ async def send_telegram_message(bot, message):
     return False
 
 def format_message(entry):
-    """Format message with MarkdownV2 escaping [[5]][[10]]."""
+    """Format message with MarkdownV2 escaping"""
     return (
         f"⚠️ *မြေငလျင် သတိပေးချက်* ⚠️\n\n"
-        f"*ပြင်းအား :* {escape_markdown(entry['magnitude'], 2)}\n"
+        f"*ပြင်းအား :* {escape_markdown(str(entry['magnitude']), 2)}\n"
         f"*အနီးဆုံးမြို့ :* {escape_markdown(entry['nearest_city'], 2)}\n"
         f"*အချိန် :* {escape_markdown(entry['time_mmt'], 2)}\n"
-        f"*ဗဟိုချက် တည်နေရာ :* {escape_markdown(entry['latitude'], 2)}, "
-        f"{escape_markdown(entry['longitude'], 2)}\n"
-        f"*အနက် :* {escape_markdown(entry['depth_km'], 2)} km\n\n"
-        f"[အပြည့်စုံဖတ်ရှုရန်]({entry['link']})"
+        f"*ဗဟိုချက် တည်နေရာ :* {escape_markdown(str(entry['latitude']), 2)}, "
+        f"{escape_markdown(str(entry['longitude']), 2)}\n"
+        f"*အနက် :* {escape_markdown(str(entry['depth_km']), 2)} km\n\n"
+        f"[အပြည့်စုံဖတ်ရှုရန်]({entry['link']})"
     )
 
 async def main():
     bot = Bot(token=BOT_TOKEN)
     processed_ids = set()
     
-    # Load existing IDs
+    # Load existing processed IDs
     if STORAGE_PATH.exists():
         with open(STORAGE_PATH, 'r') as f:
             processed_ids.update(f.read().splitlines())
@@ -126,39 +147,55 @@ async def main():
             await asyncio.sleep(CHECK_INTERVAL)
             continue
         
-        # Process entries from newest to oldest [[4]]
-        for entry in feed.entries:
+        # Process entries from oldest to newest
+        for entry in reversed(feed.entries):
             current_id = entry.get('id', entry.link)
             
             if current_id in processed_ids:
-                continue  # Skip already processed entries [[6]]
-                
-            # Preliminary filter
-            if "Myanmar" not in entry.get('title', ''):
-                processed_ids.add(current_id)
                 continue
                 
-            # Full processing
+            # Parse entry data
             quake_data = await parse_entry(entry)
-            
-            # Final country check
-            if quake_data['country_code'] != 'MM':
-                logging.info(f"Filtered non-Myanmar: {current_id}")
+            if not quake_data:
+                continue
+
+            # Magnitude filtering
+            try:
+                magnitude = float(quake_data['magnitude'])
+                if magnitude < 2.9:
+                    logging.info(f"Ignored earthquake below 2.9: {current_id}")
+                    processed_ids.add(current_id)
+                    with open(STORAGE_PATH, 'a') as f:
+                        f.write(f"{current_id}\n")
+                    continue
+            except ValueError:
+                logging.warning(f"Invalid magnitude value: {quake_data['magnitude']}")
                 processed_ids.add(current_id)
+                with open(STORAGE_PATH, 'a') as f:
+                    f.write(f"{current_id}\n")
+                continue
+
+            # Country filter
+            if quake_data['country_code'] != 'MM':
+                logging.info(f"Filtered non-Myanmar earthquake: {current_id}")
+                processed_ids.add(current_id)
+                with open(STORAGE_PATH, 'a') as f:
+                    f.write(f"{current_id}\n")
                 continue
                 
-            # Message preparation
+            # Prepare and send message
             message = format_message(quake_data)
-            
-            # Send and track
             if await send_telegram_message(bot, message):
                 processed_ids.add(current_id)
                 with open(STORAGE_PATH, 'a') as f:
                     f.write(f"{current_id}\n")
-                logging.info(f"Sent: {current_id} | Mag: {quake_data['magnitude']}")
+                logging.info(f"Sent alert: {current_id}")
                 await asyncio.sleep(RATE_LIMIT_DELAY)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot shutdown by user")
